@@ -1,0 +1,29 @@
+{
+  "name": "mcp-zerobounce",
+  "version": "1.0.0",
+  "description": "A Model Context Protocol (MCP) server for accessing ZeroBounce API endpoints.",
+  "main": "build/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "dev": "npx @smithery/cli dev",
+    "start": "node build/index.js"
+  },
+  "keywords": [
+    "mcp",
+    "zerobounce",
+    "email",
+    "validation"
+  ],
+  "author": "hithereiamaliff",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "axios": "^1.7.2",
+    "form-data": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.12",
+    "typescript": "^5.4.5"
+  }
+}
