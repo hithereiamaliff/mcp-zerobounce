@@ -1,0 +1,14 @@
+.dockerignore
+.editorconfig
+.env
+.git
+.github
+.gitignore
+.npmrc
+.releaserc
+.vscode/
+dist/
+node_modules/
+npm-debug.log
+README.md
+src/
