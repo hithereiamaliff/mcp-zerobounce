@@ -29,6 +29,13 @@ lerna-debug.log*
 *.sln
 *.sw?
 
-#- Miscellaneous
+# Miscellaneous
 .DS_Store
 Thumbs.db
+
+# Analytics data
+data/
+analytics.json
+
+# Credentials
+.credentials/

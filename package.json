@@ -4,26 +4,47 @@
   "description": "A Model Context Protocol (MCP) server for accessing ZeroBounce API endpoints.",
   "main": "build/index.js",
   "type": "module",
+  "bin": {
+    "mcp-zerobounce": "build/index.js"
+  },
+  "files": [
+    "build/"
+  ],
   "scripts": {
     "build": "tsc",
+    "build:tsc": "tsc",
     "dev": "npx @smithery/cli dev",
-    "start": "node build/index.js"
+    "dev:http": "npx tsx src/http-server.ts",
+    "start": "node build/index.js",
+    "start:http": "node build/http-server.js",
+    "prepare": "npm run build"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "keywords": [
     "mcp",
     "zerobounce",
     "email",
-    "validation"
+    "validation",
+    "email-validation",
+    "model-context-protocol"
   ],
   "author": "hithereiamaliff",
   "license": "MIT",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.1",
+    "@modelcontextprotocol/sdk": "^1.17.4",
     "axios": "^1.7.2",
-    "form-data": "^4.0.0"
+    "cors": "^2.8.5",
+    "express": "^4.21.0",
+    "form-data": "^4.0.0",
+    "zod": "^3.23.8"
   },
   "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
     "@types/node": "^20.12.12",
+    "tsx": "^4.20.5",
     "typescript": "^5.4.5"
   }
 }

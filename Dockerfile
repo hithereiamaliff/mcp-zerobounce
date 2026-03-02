@@ -1,23 +1,50 @@
-# Use an official Node.js runtime as a parent image
-FROM node:18-slim
+# ZeroBounce MCP Server - Streamable HTTP
+# For self-hosting on VPS with nginx reverse proxy
 
-# Set the working directory in the container
-WORKDIR /usr/src/app
+FROM node:20-alpine
 
-# Copy package.json and package-lock.json to the working directory
+WORKDIR /app
+
+# Copy package files
 COPY package*.json ./
+COPY tsconfig.json ./
 
-# Install any needed packages
-RUN npm install
+# Install ALL dependencies (including devDependencies for build)
+# Skip prepare script since source files aren't copied yet
+RUN npm ci --ignore-scripts
 
-# Bundle app source
-COPY . .
+# Copy source code
+COPY src/ ./src/
 
-# Build the TypeScript source code
-RUN npm run build
+# Build TypeScript
+RUN npm run build:tsc
 
-# Your app binds to port 8080 so you need to expose it
+# Remove devDependencies after build
+RUN npm prune --production
+
+# Create non-root user for security
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S mcp -u 1001
+
+# Create data directory for analytics
+RUN mkdir -p /app/data
+
+# Set ownership
+RUN chown -R mcp:nodejs /app
+
+USER mcp
+
+# Expose port for HTTP server
 EXPOSE 8080
 
-# Define the command to run your app
-CMD [ "npm", "start" ]
+# Environment variables (can be overridden at runtime)
+ENV PORT=8080
+ENV HOST=0.0.0.0
+ENV ANALYTICS_DIR=/app/data
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+  CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
+
+# Start the HTTP server
+CMD ["node", "build/http-server.js"]
