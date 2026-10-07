@@ -1,5 +1,10 @@
-# ZeroBounce MCP Server - Docker Compose
-# For self-hosting on VPS
+# ZeroBounce MCP Server - Docker Compose (VPS)
+#
+# - Bound to 127.0.0.1 only: the container is reachable through nginx, never
+#   directly from the internet (Docker-published ports otherwise bypass ufw).
+# - Joins the shared external "mcp-network" so it can reach mcp-key-service
+#   by container name (created by the mcp-key-service deploy, or by the
+#   deploy workflow in this repo if missing).
 
 services:
   mcp-zerobounce:
@@ -7,21 +12,37 @@ services:
     container_name: mcp-zerobounce
     restart: unless-stopped
     ports:
-      - "8087:8080"
+      - "127.0.0.1:8095:8080"
     environment:
       - PORT=8080
       - HOST=0.0.0.0
-      - ANALYTICS_DIR=/app/data
       - NODE_ENV=production
+      - ANALYTICS_DIR=/app/data
+      - PUBLIC_BASE_PATH=${PUBLIC_BASE_PATH:-/zerobounce}
+      # Hosted mode (mcp-key-service). On the VPS:
+      #   KEY_SERVICE_URL=http://mcp-key-service:8090/internal/resolve
+      - KEY_SERVICE_URL=${KEY_SERVICE_URL:-}
+      - KEY_SERVICE_TOKEN=${KEY_SERVICE_TOKEN:-}
+      - KEY_PORTAL_URL=${KEY_PORTAL_URL:-https://mcpkeys.techmavie.digital}
+      # Self-hosted mode + analytics access
+      - MCP_API_KEY=${MCP_API_KEY:-}
       - ZEROBOUNCE_API_KEY=${ZEROBOUNCE_API_KEY:-}
+      - ZEROBOUNCE_REGION=${ZEROBOUNCE_REGION:-}
+      # Optional
+      - MCP_BODY_LIMIT=${MCP_BODY_LIMIT:-10mb} # keep below nginx client_max_body_size (12M)
+      - ZEROBOUNCE_MAX_RESULT_MB=${ZEROBOUNCE_MAX_RESULT_MB:-20}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-}
+      - MCP_PROTOCOL_VERSION=${MCP_PROTOCOL_VERSION:-2025-11-25}
+      - MCP_TRACE_HTTP=${MCP_TRACE_HTTP:-false}
+      - ENABLE_MCP_DIAGNOSTICS=${ENABLE_MCP_DIAGNOSTICS:-false}
     volumes:
       - analytics-data:/app/data
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://127.0.0.1:8080/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 10s
+      start_period: 20s
     networks:
       - mcp-network
     logging:
@@ -32,8 +53,7 @@ services:
 
 networks:
   mcp-network:
-    driver: bridge
+    external: true
 
 volumes:
   analytics-data:
-    driver: local

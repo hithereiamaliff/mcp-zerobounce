@@ -1,271 +1,238 @@
 # ZeroBounce MCP Server
 
-[![smithery badge](https://smithery.ai/badge/zerobounce-mcp)](https://smithery.ai/server/zerobounce-mcp)
+An MCP (Model Context Protocol) server for the [ZeroBounce](https://www.zerobounce.net/) email validation API. It lets Claude and other AI assistants validate email addresses, find business emails, score leads with AI, manage allow/block filters, run bulk jobs, and evaluate lists.
 
-A Model Context Protocol (MCP) server for accessing ZeroBounce API endpoints, providing tools for email validation, email finding, AI scoring, activity data, and bulk list evaluation.
+**21 tools** across validation, email finding, filters, bulk files and list evaluation. Run it hosted (multi-user, via [mcp-key-service](https://mcpkeys.techmavie.digital)) or locally over stdio.
 
-**MCP Endpoint:** `https://mcp.techmavie.digital/zerobounce/mcp`
+**Hosted endpoint:** `https://mcp.techmavie.digital/zerobounce/mcp/usr_YOUR_KEY`
 
-**Analytics Dashboard:** [`https://mcp.techmavie.digital/zerobounce/analytics/dashboard`](https://mcp.techmavie.digital/zerobounce/analytics/dashboard)
+## Quick start
 
-## Features
+### Option 1: Hosted (recommended)
 
-- **Real-Time Email Validation** — Instantly verify email addresses to reduce bounce rates
-- **Email Finder** — Discover email formats for specific domains or company names
-- **AI-Powered Scoring** — Submit files for AI quality scoring of email lists
-- **Activity Data** — Gain insights into the engagement activity of an email address
-- **Bulk List Evaluation** — Process and evaluate entire email lists for quality and deliverability
-- **Credits & Usage** — Check remaining API credits and usage statistics
-- **Multi-Transport Support** — Both stdio (for MCP clients) and Streamable HTTP (for VPS hosting)
-- **Analytics Dashboard** — Built-in visual dashboard with Chart.js for usage monitoring
-- **VPS Deployment Ready** — Docker, Nginx, and GitHub Actions auto-deployment support
+1. Sign in at **https://mcpkeys.techmavie.digital** and create a **ZeroBounce** connection with your ZeroBounce API key. Optionally set the region to `us` or `eu`.
+2. Copy your personal key (`usr_...`).
+3. Add the server to your MCP client:
 
-## Architecture
+   ```text
+   https://mcp.techmavie.digital/zerobounce/mcp/usr_YOUR_KEY
+   ```
 
-```
-AI Assistant (Claude, Cursor, Windsurf, etc.)
-    ↓ HTTPS
-https://mcp.techmavie.digital/zerobounce/mcp
-    ↓
-Nginx (SSL termination + reverse proxy)
-    ↓ HTTP
-Docker Container (port 8087 → 8080)
-    ↓
-MCP Server (Streamable HTTP Transport)
-    ↓
-ZeroBounce API (api.zerobounce.net)
-```
+   ```json
+   {
+     "mcpServers": {
+       "zerobounce": {
+         "type": "http",
+         "url": "https://mcp.techmavie.digital/zerobounce/mcp/usr_YOUR_KEY"
+       }
+     }
+   }
+   ```
 
-## Quick Start (Hosted Server)
+   `?api_key=usr_YOUR_KEY` on `/mcp` also works for clients that can't use the path form.
 
-The easiest way to use this MCP server is via the hosted endpoint. **No installation required!**
+Your ZeroBounce key is stored encrypted in the key service and is never written to this server's disk or shared between users.
 
-### Client Configuration
-
-For Claude Desktop / Cursor / Windsurf, add to your MCP configuration:
-
-```json
-{
-  "mcpServers": {
-    "zerobounce": {
-      "transport": "streamable-http",
-      "url": "https://mcp.techmavie.digital/zerobounce/mcp?apiKey=YOUR_ZEROBOUNCE_API_KEY"
-    }
-  }
-}
-```
-
-### Using with npx (stdio transport)
+### Option 2: Local (stdio)
 
 ```json
 {
   "mcpServers": {
     "zerobounce": {
       "command": "npx",
-      "args": ["-y", "mcp-zerobounce"],
+      "args": ["-y", "github:hithereiamaliff/mcp-zerobounce"],
       "env": {
-        "ZEROBOUNCE_API_KEY": "your_api_key_here"
+        "ZEROBOUNCE_API_KEY": "your_zerobounce_api_key",
+        "ZEROBOUNCE_REGION": ""
       }
     }
   }
 }
 ```
 
-## Configuration
+In local mode the bulk tools can also read a CSV from your disk (`file_path`) and save results (`save_to_path`).
 
-### API Key
+### Option 3: Self-hosted HTTP
 
-A ZeroBounce API key is required. Get one at [zerobounce.net](https://www.zerobounce.net/).
+Run your own instance (see [deploy/DEPLOYMENT.md](deploy/DEPLOYMENT.md)) and authenticate with headers:
 
-The API key can be provided in multiple ways (in order of priority):
+```bash
+curl -X POST https://your-host/mcp \
+  -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
+  -H "X-API-Key: YOUR_MCP_API_KEY" \
+  -H "X-ZeroBounce-Api-Key: YOUR_ZEROBOUNCE_KEY" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
 
-1. **Per-tool parameter** — Pass `apiKey` in each tool call
-2. **URL query parameter** — `?apiKey=YOUR_KEY` (hosted server)
-3. **HTTP header** — `X-API-Key: YOUR_KEY` (hosted server)
-4. **Environment variable** — `ZEROBOUNCE_API_KEY`
+## Authentication modes
 
-### Environment Variables
+| Mode | How | Notes |
+|---|---|---|
+| Hosted | `/mcp/usr_...` or `/mcp?api_key=usr_...` | Key resolved through mcp-key-service (cached 60s). |
+| Hosted (header) | `/mcp` with `Authorization: Bearer usr_...` or `X-API-Key: usr_...` | Same as above, for clients that support custom headers. Keeps the key out of URLs. |
+| Self-hosted | `X-API-Key: <MCP_API_KEY>` + `X-ZeroBounce-Api-Key` | Optional `X-ZeroBounce-Region`. Disabled unless `MCP_API_KEY` is set. Falls back to the server's `ZEROBOUNCE_API_KEY` if the header is absent. |
+| Local CLI | `ZEROBOUNCE_API_KEY` env var | stdio transport. |
+
+Raw ZeroBounce keys in the URL (`?apiKey=...`) and per-tool `apiKey` parameters from v1 are **no longer accepted**.
+
+## Tools
+
+Every tool description states its credit cost, and every tool carries MCP annotations: credit-spending tools are not marked read-only, and delete tools are marked destructive. Clients like Claude therefore ask before running them. Full parameter reference: **[TOOLS.md](TOOLS.md)**.
+
+| Group | Tool | What it does | Cost |
+|---|---|---|---|
+| Utility | `zerobounce_hello` | Server status, connection mode, region | Free |
+| Account | `zerobounce_get_credits` | Credit balance | Free |
+| | `zerobounce_get_api_usage` | Usage by status/sub-status for a date range | Free |
+| Validation | `zerobounce_validate_email` | Validate one address (verdict + details) | 1 credit (unknown free) |
+| | `zerobounce_validate_batch` | Validate 1-100 addresses (de-duplicated) | 1 per email |
+| | `zerobounce_get_activity_data` | When an address was last active | Free if not found (needs ZeroBounce ONE) |
+| | `zerobounce_score_email` | AI quality score 0-10 | 1 credit |
+| Email Finder | `zerobounce_find_email` | A person's email from name + domain/company | 20 per address found |
+| | `zerobounce_domain_search` | A company's email format | 20 per format found |
+| Filters | `zerobounce_list_filters` | List allow/block rules | Free |
+| | `zerobounce_add_filter` | Add/update an allow or block rule | Free |
+| | `zerobounce_delete_filter` | Delete a rule | Free |
+| Bulk files | `zerobounce_bulk_validate` | Submit a list for validation | 1 per email |
+| | `zerobounce_bulk_score` | Submit a list for AI scoring | 1 per email |
+| | `zerobounce_bulk_find_emails` | Find emails for many contacts | 20 per address found |
+| | `zerobounce_bulk_domain_search` | Find formats for many domains | 20 per format found |
+| | `zerobounce_bulk_status` | Progress of a bulk file | Free |
+| | `zerobounce_bulk_results` | Summary or paged rows of results | Free |
+| | `zerobounce_bulk_delete` | Delete a bulk file | Free |
+| List Evaluator | `zerobounce_evaluate_list` | Free risk estimate for a list (100+ emails) | Free |
+| | `zerobounce_evaluate_list_status` | Evaluation results | Free |
+
+### Verdicts
+
+Validation results are summarised as:
+
+| Verdict | ZeroBounce status | Meaning |
+|---|---|---|
+| **SAFE** | `valid` | OK to send |
+| **RISKY** | `catch-all` | Domain accepts everything. `zerobounce_score_email` can help prioritise |
+| **UNVERIFIED** | `unknown` | Couldn't verify right now. Not charged; retry later |
+| **WILL BOUNCE** | `invalid` | Remove |
+| **DO NOT SEND** | `do_not_mail`, `spamtrap`, `abuse` | Remove (the sub-status says why: disposable, role-based, toxic...) |
+
+Pass `response_format: "json"` to any data tool for the raw ZeroBounce response.
+
+### Testing without spending credits
+
+ZeroBounce's sandbox addresses return fixed results and use no credits: `valid@example.com`, `invalid@example.com`, `catch_all@example.com`, `unknown@example.com`, `spamtrap@example.com`, `abuse@example.com`, `donotmail@example.com`, `disposable@example.com`, `toxic@example.com`, `role_based@example.com`, `possible_typo@example.com`.
+
+### Bulk workflow
+
+```text
+zerobounce_bulk_validate (emails[] or csv_content)  →  file_id
+zerobounce_bulk_status   (service, file_id)         →  Queued / Processing / Complete
+zerobounce_bulk_results  (service, file_id)         →  summary, then view="rows" with filter/offset/limit
+zerobounce_bulk_delete   (service, file_id)         →  optional clean-up
+```
+
+Results are never dumped in full: you get a summary (counts by status, score, found rate or format), then one page of rows at a time. The hosted server reads results files up to 20 MB (roughly 100k+ rows). Download bigger files from the ZeroBounce dashboard, or use the local CLI with `save_to_path`.
+
+## API regions
+
+| Region | Host | Processing |
+|---|---|---|
+| `default` (blank) | `api.zerobounce.net` | EU |
+| `us` | `api-us.zerobounce.net` | United States only |
+| `eu` | `api-eu.zerobounce.net` | European Union only |
+
+Bulk file endpoints always use `bulkapi.zerobounce.net`. Regions are an allowlist: the server never sends a key to any other host.
+
+## HTTP endpoints
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/` | GET | Server info |
+| `/health` | GET | Health check |
+| `/mcp/:userKey` | POST | MCP, hosted mode |
+| `/mcp` | POST | MCP, `?api_key=usr_...` or self-hosted headers |
+| `/.well-known/mcp/server-card.json` | GET | Discovery card listing all tools |
+| `/analytics` | GET | Usage JSON (requires `X-API-Key`) |
+| `/analytics/tools` | GET | Per-tool counts, errors, average latency (requires `X-API-Key`) |
+| `/analytics/dashboard` | GET | Dashboard (asks for the API key) |
+| `/mcp-debug/open` | POST | Diagnostics ping, only if `ENABLE_MCP_DIAGNOSTICS=true` |
+
+The server is stateless: `GET`/`DELETE` on `/mcp` return 405.
+
+## Environment variables
 
 | Variable | Default | Description |
-|----------|---------|-------------|
-| `ZEROBOUNCE_API_KEY` | — | ZeroBounce API key |
-| `PORT` | `8080` | HTTP server port |
-| `HOST` | `0.0.0.0` | HTTP server host |
-| `ANALYTICS_DIR` | `/app/data` | Analytics data directory |
-| `ANALYTICS_IMPORT_KEY` | — | Secret key for analytics import endpoint |
+|---|---|---|
+| `KEY_SERVICE_URL` | none | mcp-key-service resolve URL (hosted mode) |
+| `KEY_SERVICE_TOKEN` | none | Bearer token; must match `zerobounce:<token>` in the key service |
+| `MCP_API_KEY` | none | Enables self-hosted mode and analytics |
+| `ZEROBOUNCE_API_KEY` | none | CLI key / self-hosted fallback |
+| `ZEROBOUNCE_REGION` | `default` | `default`, `us` or `eu` (CLI / self-hosted) |
+| `PORT` / `HOST` | `8080` / `0.0.0.0` | HTTP listen address |
+| `PUBLIC_BASE_PATH` | none | Path prefix added by nginx (e.g. `/zerobounce`) |
+| `ANALYTICS_DIR` | `/app/data` | Where `analytics.json` is stored |
+| `ALLOWED_ORIGINS` | `*` | CORS allowlist (comma-separated) |
+| `MCP_BODY_LIMIT` | `10mb` | Max request size (inline bulk uploads) |
+| `ZEROBOUNCE_MAX_RESULT_MB` | `20` | Largest bulk results file the HTTP server downloads and parses (CLI: 100) |
+| `MCP_TRACE_HTTP` | `false` | Log one line per MCP request (no secrets) |
+| `ENABLE_MCP_DIAGNOSTICS` | `false` | Enable `/mcp-debug/open` |
 
-## Available Tools
+See [.env.sample](.env.sample) for a commented template.
 
-| Tool | Description |
-|------|-------------|
-| `hello` | Test tool to verify server connectivity |
-| `validate_email` | Validate a single email address |
-| `find_email` | Find email format for a domain or company |
-| `scoring_send_file` | Submit a file for AI scoring |
-| `scoring_file_status` | Check status of a submitted scoring file |
-| `scoring_get_file` | Get results of a scored file |
-| `scoring_delete_file` | Delete a scored file |
-| `get_activity_data` | Get activity data for an email address |
-| `list_evaluator` | Submit a file for list evaluation |
-| `get_credits` | Check remaining API credits |
-| `get_api_usage` | Get API usage statistics for a date range |
-
-For detailed schemas and descriptions, see [TOOLS.md](./TOOLS.md).
-
-## AI Integration
-
-When integrating with AI models:
-
-1. **Start with validation** — Use `validate_email` before performing other actions
-2. **Check credits** — Use `get_credits` to verify available balance
-3. **Bulk operations workflow** — Submit file → check status → retrieve results
-4. **Activity insights** — Use `get_activity_data` for engagement context on valid emails
-
-## Installation
+## Local development
 
 ```bash
 npm install
+npm run build         # compile to dist/
+npm test              # unit + HTTP integration tests (no network)
+npm run dev:http      # HTTP server with tsx on :8080
+npm run cli           # stdio server
+npm run docs:tools    # regenerate TOOLS.md from the tool definitions
+
+# Live check against ZeroBounce using sandbox addresses only (0 credits):
+ZEROBOUNCE_API_KEY=... npm run smoke
 ```
 
-## Local Development
+## Project structure
 
-```bash
-# Run HTTP server in development mode
-npm run dev:http
-
-# Or build and run production version
-npm run build
-npm run start:http
-
-# Test health endpoint
-curl http://localhost:8080/health
-
-# Test MCP endpoint
-curl -X POST http://localhost:8080/mcp \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
-```
-
-## Self-Hosted VPS Deployment
-
-### Quick Deploy
-
-```bash
-# On your VPS
-cd /opt/mcp-servers
-git clone https://github.com/hithereiamaliff/mcp-zerobounce.git zerobounce
-cd zerobounce
-
-# Create .env file
-echo "ZEROBOUNCE_API_KEY=your_key_here" > .env
-
-# Build and start
-docker compose up -d --build
-
-# Check logs
-docker compose logs -f
-```
-
-### Deployment Files
-
-| File | Purpose |
-|------|---------|
-| `Dockerfile` | Container configuration (Node.js 20-alpine) |
-| `docker-compose.yml` | Docker orchestration with analytics volume |
-| `deploy/nginx-mcp.conf` | Nginx reverse proxy configuration |
-| `.github/workflows/deploy-vps.yml` | GitHub Actions auto-deployment |
-
-### GitHub Actions Secrets
-
-Set these in your repository settings:
-
-| Secret | Description |
-|--------|-------------|
-| `VPS_HOST` | VPS IP address |
-| `VPS_USERNAME` | SSH username |
-| `VPS_SSH_KEY` | Private SSH key |
-| `VPS_PORT` | SSH port (usually `22`) |
-| `ZEROBOUNCE_API_KEY` | ZeroBounce API key |
-
-### Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/` | GET | Server info |
-| `/health` | GET | Health check |
-| `/mcp` | POST | MCP requests (JSON-RPC) |
-| `/analytics` | GET | Analytics JSON data |
-| `/analytics/dashboard` | GET | Visual analytics dashboard |
-| `/analytics/tools` | GET | Tool usage statistics |
-
-## Analytics Dashboard
-
-The server includes a built-in analytics dashboard that tracks:
-
-- Total requests and tool calls
-- Tool usage distribution (doughnut chart)
-- Hourly request trends (last 24 hours)
-- Requests by endpoint (bar chart)
-- Top clients by user agent
-- Recent tool calls feed
-
-Auto-refreshes every 30 seconds.
-
-## Project Structure
-
-```
+```text
 src/
-├── index.ts          # Main MCP server (stdio transport)
-├── http-server.ts    # Streamable HTTP server for VPS deployment
-└── tools.ts          # ZeroBounce tool registrations (shared)
-
-deploy/
-└── nginx-mcp.conf    # Nginx reverse proxy config
-
-.github/
-└── workflows/
-    └── deploy-vps.yml  # GitHub Actions auto-deploy
+├── index.ts              Server factory (shared by CLI and HTTP), tool registration
+├── cli.ts                stdio entry point (npx)
+├── http-server.ts        Streamable HTTP server: auth modes, routes, analytics
+├── version.ts
+├── zerobounce/
+│   ├── client.ts         ZeroBounce API client (fetch, regions, retries)
+│   ├── errors.ts         Normalises ZeroBounce's error formats
+│   ├── regions.ts        Region → host allowlist
+│   ├── statuses.ts       Status/sub-status meanings and verdicts
+│   └── types.ts
+├── tools/                One file per group: account, validation, finder, filters, bulk, list-evaluator, utility
+└── utils/                key-service client, analytics, CSV, formatting, security helpers
+tests/                    node:test suites (mocked API, in-memory MCP client, real HTTP server)
+scripts/                  smoke-test.mjs (live, 0 credits), generate-tools-md.ts
+deploy/                   DEPLOYMENT.md, nginx-mcp.conf
 ```
 
-## Troubleshooting
+## Security notes
 
-### Container Issues
+- **Per-request isolation:** every HTTP request gets a new MCP server instance holding only that caller's key. Keys are never written to `process.env` or disk.
+- **No server file access over HTTP:** bulk uploads take lists or CSV text. `file_path`/`save_to_path` exist only in local CLI mode.
+- **Keys out of URLs:** real-time ZeroBounce calls send the API key in a POST body. Raw keys are refused in this server's URLs, and logs/analytics mask `usr_` keys.
+- **Fail closed:** self-hosted mode and analytics are disabled unless `MCP_API_KEY` is set. Key comparisons are constant-time.
+- **Privacy-preserving analytics:** client IPs are stored only as truncated hashes.
 
-```bash
-# Check container status
-docker compose ps
+## Compared with ZeroBounce's official MCP
 
-# View logs
-docker compose logs -f
+ZeroBounce publishes its own stdio MCP server ([`@zerobounce/mcp`](https://github.com/zerobounce/zerobounce-mcp)). This server adds:
 
-# Restart container
-docker compose restart
-
-# Rebuild and restart
-docker compose up -d --build
-```
-
-### Test MCP Connection
-
-```bash
-# List tools
-curl -X POST https://mcp.techmavie.digital/zerobounce/mcp \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
-
-# Call hello tool
-curl -X POST "https://mcp.techmavie.digital/zerobounce/mcp?apiKey=YOUR_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"hello","arguments":{}}}'
-```
-
-## Contributing
-
-1. Fork repository
-2. Create feature branch
-3. Commit changes
-4. Create pull request
+- hosted multi-user access, which works in Claude.ai web and mobile
+- allow/block filters
+- the List Evaluator
+- single-email AI scoring
+- bulk email finder and domain search
+- regional endpoints
+- summarised and paginated bulk results
 
 ## License
 
-[MIT](./LICENSE)
+[MIT](LICENSE)

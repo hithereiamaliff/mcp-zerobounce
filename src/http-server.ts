@@ -1,567 +1,561 @@
 #!/usr/bin/env node
 
 /**
- * ZeroBounce MCP Server - HTTP Server Entry Point
- * For self-hosting on VPS with nginx reverse proxy
- * Uses Streamable HTTP transport
+ * ZeroBounce MCP Server - Streamable HTTP entry point (VPS / Docker).
+ *
+ * Follows the TechMavie MCP pattern (mcp-github v2):
+ *   - A brand-new McpServer + transport for EVERY request (stateless), so one
+ *     caller's ZeroBounce key can never leak into another caller's request.
+ *   - Two ways to authenticate:
+ *       hosted       /mcp/usr_xxx  or  /mcp?api_key=usr_xxx  → resolved via mcp-key-service
+ *       self-hosted  X-API-Key: <MCP_API_KEY> + X-ZeroBounce-Api-Key (or server env key)
+ *   - The server never reads or writes local files on behalf of callers.
+ *
+ * Usage:
+ *   npm run build && node dist/http-server.js
  */
 
-import express, { Request, Response } from 'express';
+import express, { type NextFunction, type Request, type Response } from 'express';
 import cors from 'cors';
-import fs from 'fs';
-import path from 'path';
+import type { Server } from 'node:http';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { registerZeroBounceTools } from './tools.js';
+import { ALL_TOOLS, SERVER_NAME, SERVER_VERSION, createZeroBounceServer, describeTool } from './index.js';
+import { InvalidRegionError, parseRegion, type ZeroBounceRegion } from './zerobounce/regions.js';
+import { KeyServiceClient } from './utils/key-service.js';
+import { Analytics, dashboardHtml } from './utils/analytics.js';
+import { safeEqual, sanitizeUrlForLogs } from './utils/security.js';
 
+// =============================================================================
 // Configuration
+// =============================================================================
+
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const HOST = process.env.HOST || '0.0.0.0';
-const ANALYTICS_DATA_DIR = process.env.ANALYTICS_DIR || '/app/data';
-const ANALYTICS_FILE = path.join(ANALYTICS_DATA_DIR, 'analytics.json');
-const SAVE_INTERVAL_MS = 60000; // Save every 60 seconds
-const MAX_RECENT_CALLS = 100;
+const MCP_API_KEY = process.env.MCP_API_KEY || '';
+const MCP_PROTOCOL_VERSION = process.env.MCP_PROTOCOL_VERSION || '2025-11-25';
+const ENABLE_MCP_DIAGNOSTICS = process.env.ENABLE_MCP_DIAGNOSTICS === 'true';
+const MCP_TRACE_HTTP = process.env.MCP_TRACE_HTTP === 'true';
+const KEY_SERVICE_URL = process.env.KEY_SERVICE_URL || '';
+const KEY_SERVICE_TOKEN = process.env.KEY_SERVICE_TOKEN || '';
+const ANALYTICS_DIR = process.env.ANALYTICS_DIR || '/app/data';
+const PUBLIC_BASE_PATH = normalizePublicBasePath(process.env.PUBLIC_BASE_PATH || '');
+const KEY_PORTAL_URL = process.env.KEY_PORTAL_URL || 'https://mcpkeys.techmavie.digital';
+// Optional single-tenant fallback for self-hosted mode (still requires MCP_API_KEY).
+const SERVER_ZEROBOUNCE_API_KEY = process.env.ZEROBOUNCE_API_KEY?.trim() || '';
+// Large enough for bulk uploads sent inline as CSV text or email lists.
+const BODY_LIMIT = process.env.MCP_BODY_LIMIT || '10mb';
+// Largest bulk results file this shared server will download and parse.
+const MAX_RESULT_MB = Math.max(1, Number(process.env.ZEROBOUNCE_MAX_RESULT_MB) || 20);
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '*')
+  .split(',')
+  .map(origin => origin.trim())
+  .filter(Boolean);
+const ALLOW_ALL_ORIGINS = ALLOWED_ORIGINS.length === 0 || ALLOWED_ORIGINS.includes('*');
 
-// ============================================================================
-// Analytics Tracking with File Persistence
-// ============================================================================
-interface Analytics {
-  serverStartTime: string;
-  totalRequests: number;
-  totalToolCalls: number;
-  requestsByMethod: Record<string, number>;
-  requestsByEndpoint: Record<string, number>;
-  toolCalls: Record<string, number>;
-  recentToolCalls: Array<{
-    tool: string;
-    timestamp: string;
-    clientIp: string;
-    userAgent: string;
-  }>;
-  clientsByIp: Record<string, number>;
-  clientsByUserAgent: Record<string, number>;
-  hourlyRequests: Record<string, number>;
+if ((KEY_SERVICE_URL && !KEY_SERVICE_TOKEN) || (!KEY_SERVICE_URL && KEY_SERVICE_TOKEN)) {
+  console.error('KEY_SERVICE_URL and KEY_SERVICE_TOKEN must both be set (hosted mode) or both be unset.');
+  process.exit(1);
 }
 
-// Initialize analytics
-let analytics: Analytics = {
-  serverStartTime: new Date().toISOString(),
-  totalRequests: 0,
-  totalToolCalls: 0,
-  requestsByMethod: {},
-  requestsByEndpoint: {},
-  toolCalls: {},
-  recentToolCalls: [],
-  clientsByIp: {},
-  clientsByUserAgent: {},
-  hourlyRequests: {},
-};
+let DEFAULT_REGION: ZeroBounceRegion;
+try {
+  DEFAULT_REGION = parseRegion(process.env.ZEROBOUNCE_REGION);
+} catch (error) {
+  console.error(`ZEROBOUNCE_REGION: ${(error as Error).message}`);
+  process.exit(1);
+}
 
-// Ensure data directory exists
-function ensureDataDir(): void {
-  if (!fs.existsSync(ANALYTICS_DATA_DIR)) {
-    fs.mkdirSync(ANALYTICS_DATA_DIR, { recursive: true });
-    console.log(`📁 Created analytics data directory: ${ANALYTICS_DATA_DIR}`);
+if (!MCP_API_KEY) {
+  console.warn('MCP_API_KEY is not set: self-hosted /mcp access and /analytics are disabled.');
+}
+
+const keyService = new KeyServiceClient({ url: KEY_SERVICE_URL, token: KEY_SERVICE_TOKEN });
+const analytics = new Analytics(ANALYTICS_DIR);
+analytics.startAutoSave();
+
+// =============================================================================
+// Helpers
+// =============================================================================
+
+class HttpError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly code: string,
+    message: string,
+  ) {
+    super(message);
   }
 }
 
-// Load analytics from disk on startup
-function loadAnalytics(): void {
-  try {
-    ensureDataDir();
-    if (fs.existsSync(ANALYTICS_FILE)) {
-      const data = fs.readFileSync(ANALYTICS_FILE, 'utf-8');
-      const loaded = JSON.parse(data) as Analytics;
-      analytics = {
-        ...loaded,
-        serverStartTime: loaded.serverStartTime || new Date().toISOString(),
-        requestsByMethod: loaded.requestsByMethod || {},
-        requestsByEndpoint: loaded.requestsByEndpoint || {},
-        toolCalls: loaded.toolCalls || {},
-        recentToolCalls: loaded.recentToolCalls || [],
-        clientsByIp: loaded.clientsByIp || {},
-        clientsByUserAgent: loaded.clientsByUserAgent || {},
-        hourlyRequests: loaded.hourlyRequests || {},
-      };
-      console.log(`📊 Loaded analytics from ${ANALYTICS_FILE}`);
-      console.log(`   Total requests: ${analytics.totalRequests}`);
-    } else {
-      console.log(`📊 No existing analytics file, starting fresh`);
-    }
-  } catch (error) {
-    console.error(`⚠️ Failed to load analytics:`, error);
-  }
+function normalizePublicBasePath(basePath: string): string {
+  const trimmed = basePath.trim();
+  if (!trimmed || trimmed === '/') return '';
+  return (trimmed.startsWith('/') ? trimmed : `/${trimmed}`).replace(/\/+$/, '');
 }
 
-// Save analytics to disk
-function saveAnalytics(): void {
-  try {
-    ensureDataDir();
-    fs.writeFileSync(ANALYTICS_FILE, JSON.stringify(analytics, null, 2));
-    console.log(`💾 Saved analytics to ${ANALYTICS_FILE}`);
-  } catch (error) {
-    console.error(`⚠️ Failed to save analytics:`, error);
-  }
+function withPublicBasePath(route: string): string {
+  return `${PUBLIC_BASE_PATH}${route}`;
 }
 
-// Track HTTP request
-function trackRequest(req: Request, endpoint: string): void {
-  analytics.totalRequests++;
+/**
+ * Map a request to a fixed route name for analytics and logs.
+ * Express matches routes case-insensitively, so compare case-insensitively too,
+ * and never record raw paths: they could contain usr_ keys (/MCP/usr_...) or
+ * scanner noise that would grow analytics.json forever.
+ */
+const KNOWN_ROUTES = new Set(['/', '/health', '/mcp', '/mcp-debug/open', '/.well-known/mcp/server-card.json']);
 
-  const method = req.method;
-  analytics.requestsByMethod[method] = (analytics.requestsByMethod[method] || 0) + 1;
-
-  analytics.requestsByEndpoint[endpoint] = (analytics.requestsByEndpoint[endpoint] || 0) + 1;
-
-  const clientIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.ip || 'unknown';
-  analytics.clientsByIp[clientIp] = (analytics.clientsByIp[clientIp] || 0) + 1;
-
-  const userAgent = req.headers['user-agent'] || 'unknown';
-  const shortAgent = userAgent.substring(0, 50);
-  analytics.clientsByUserAgent[shortAgent] = (analytics.clientsByUserAgent[shortAgent] || 0) + 1;
-
-  const hour = new Date().toISOString().substring(0, 13);
-  analytics.hourlyRequests[hour] = (analytics.hourlyRequests[hour] || 0) + 1;
+function normalizeRoute(req: Request): string {
+  const p = req.path.toLowerCase().replace(/\/+$/, '') || '/';
+  if (p.startsWith('/mcp/')) return '/mcp/:userKey';
+  if (KNOWN_ROUTES.has(p)) return p;
+  if (p.startsWith('/.well-known/oauth-')) return '/.well-known/oauth-*';
+  if (p.startsWith('/analytics')) return '/analytics';
+  return '(other)';
 }
 
-// Track tool call
-function trackToolCall(toolName: string, req: Request): void {
-  analytics.totalToolCalls++;
-  analytics.toolCalls[toolName] = (analytics.toolCalls[toolName] || 0) + 1;
-
-  const toolCall = {
-    tool: toolName,
-    timestamp: new Date().toISOString(),
-    clientIp: (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.ip || 'unknown',
-    userAgent: (req.headers['user-agent'] || 'unknown').substring(0, 50),
-  };
-
-  analytics.recentToolCalls.unshift(toolCall);
-  if (analytics.recentToolCalls.length > MAX_RECENT_CALLS) {
-    analytics.recentToolCalls.pop();
-  }
-}
-
-// Calculate uptime
-function getUptime(): string {
-  const start = new Date(analytics.serverStartTime).getTime();
-  const now = Date.now();
-  const diff = now - start;
-
-  const days = Math.floor(diff / (1000 * 60 * 60 * 24));
-  const hours = Math.floor((diff % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
-  const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
-
-  if (days > 0) return `${days}d ${hours}h ${minutes}m`;
-  if (hours > 0) return `${hours}h ${minutes}m`;
-  return `${minutes}m`;
-}
-
-// Load analytics on startup
-loadAnalytics();
-
-// Periodic save
-const saveInterval = setInterval(() => {
-  saveAnalytics();
-}, SAVE_INTERVAL_MS);
-
-// ============================================================================
-// MCP Server Factory
-// ============================================================================
-
-function createMcpServer(apiKey?: string): McpServer {
-  // Set the API key in environment if provided via query param
-  if (apiKey) {
-    process.env.ZEROBOUNCE_API_KEY = apiKey;
-  }
-
-  const server = new McpServer({
-    name: 'mcp-zerobounce',
-    version: '1.0.0',
-    capabilities: {
-      tools: {},
-      logging: {},
-    },
+function traceHttp(req: Request, res: Response, details: Record<string, unknown> = {}): void {
+  if (!MCP_TRACE_HTTP) return;
+  console.log('[mcp-http]', {
+    method: req.method,
+    path: normalizeRoute(req),
+    accept: req.get('accept'),
+    contentType: req.get('content-type'),
+    protocolVersion: req.get('mcp-protocol-version'),
+    rpcMethod: req.body?.method,
+    status: res.statusCode,
+    ...details,
   });
+}
 
-  registerZeroBounceTools(server);
+/** JSON-RPC shaped error so MCP clients can show the message. */
+function sendError(req: Request, res: Response, error: HttpError): void {
+  if (res.headersSent) return;
+  const id = req.body && (typeof req.body.id === 'string' || typeof req.body.id === 'number') ? req.body.id : null;
+  res.status(error.status).json({
+    jsonrpc: '2.0',
+    error: {
+      code: error.status >= 500 ? -32603 : -32600,
+      message: error.message,
+      data: { reason: error.code },
+    },
+    id,
+  });
+}
+
+/**
+ * The SDK rejects requests whose Accept header doesn't list both
+ * application/json and text/event-stream. Some clients omit one, so add them.
+ * Patches both req.headers and req.rawHeaders (the SDK's Hono adapter reads both).
+ */
+function ensureAcceptHeader(req: Request): void {
+  const current = req.headers.accept || '';
+  const missing = ['application/json', 'text/event-stream'].filter(type => !current.includes(type));
+  if (!missing.length) return;
+  const value = [current, ...missing].filter(Boolean).join(', ');
+  req.headers.accept = value;
+  const index = req.rawHeaders.findIndex((name, i) => i % 2 === 0 && name.toLowerCase() === 'accept');
+  if (index >= 0) req.rawHeaders[index + 1] = value;
+  else req.rawHeaders.push('Accept', value);
+}
+
+// =============================================================================
+// Credential resolution
+// =============================================================================
+
+interface Credentials {
+  apiKey: string;
+  region: ZeroBounceRegion;
+  authMode: string;
+}
+
+function regionOrError(value: string | undefined, fallback: ZeroBounceRegion, hint: string): ZeroBounceRegion {
+  if (value === undefined || value.trim() === '') return fallback;
+  try {
+    return parseRegion(value);
+  } catch (error) {
+    if (error instanceof InvalidRegionError) throw new HttpError(400, 'invalid_region', `${error.message} ${hint}`);
+    throw error;
+  }
+}
+
+/** Hosted mode: swap a usr_ key for the caller's ZeroBounce credentials. */
+async function resolveHosted(userKey: string): Promise<Credentials> {
+  if (!userKey.startsWith('usr_')) {
+    throw new HttpError(
+      401,
+      'invalid_key',
+      `Expected a personal key starting with "usr_". Create one for ZeroBounce at ${KEY_PORTAL_URL}`,
+    );
+  }
+  if (!keyService.enabled) {
+    throw new HttpError(503, 'service_unavailable', 'Hosted key mode is not configured on this server.');
+  }
+
+  const result = await keyService.resolve(userKey);
+  if (!result.ok) {
+    if (result.reason === 'invalid_key') {
+      throw new HttpError(
+        403,
+        'invalid_key',
+        `This key is invalid, revoked or suspended. Check your ZeroBounce connection at ${KEY_PORTAL_URL}`,
+      );
+    }
+    if (result.reason === 'malformed_response') {
+      throw new HttpError(502, 'malformed_response', 'The key service returned an unexpected response. Please try again later.');
+    }
+    throw new HttpError(503, 'service_unavailable', 'The key service is temporarily unavailable. Please try again shortly.');
+  }
+
+  return {
+    apiKey: result.credentials.apiKey,
+    // A region saved in the portal is used as-is; blank means the default endpoint.
+    region: regionOrError(result.credentials.region, 'default', `Fix the region on your ZeroBounce connection at ${KEY_PORTAL_URL}.`),
+    authMode: 'hosted (mcp-key-service)',
+  };
+}
+
+/** Self-hosted mode: shared MCP_API_KEY gate + the caller's ZeroBounce key in a header. */
+function resolveSelfHosted(req: Request): Credentials {
+  if (!MCP_API_KEY) {
+    throw new HttpError(503, 'server_misconfigured', 'Self-hosted mode is disabled: MCP_API_KEY is not set on this server.');
+  }
+  if (!safeEqual(req.get('X-API-Key'), MCP_API_KEY)) {
+    throw new HttpError(401, 'unauthorized', 'Invalid or missing X-API-Key header.');
+  }
+  const apiKey = req.get('X-ZeroBounce-Api-Key')?.trim() || SERVER_ZEROBOUNCE_API_KEY;
+  if (!apiKey) {
+    throw new HttpError(400, 'missing_config', 'Send your ZeroBounce API key in the X-ZeroBounce-Api-Key header.');
+  }
+  return {
+    apiKey,
+    region: regionOrError(req.get('X-ZeroBounce-Region'), DEFAULT_REGION, 'Use the X-ZeroBounce-Region header with default, us or eu.'),
+    authMode: 'self-hosted (X-API-Key)',
+  };
+}
+
+/** Pick the auth mode for a request to /mcp (no key in the path). */
+async function resolveFromRequest(req: Request): Promise<Credentials> {
+  // A usr_ key sent in a header (for clients that support custom headers) keeps it out of URLs entirely.
+  const bearerKey = /^Bearer\s+(usr_\S+)$/i.exec(req.get('Authorization') || '')?.[1];
+  if (bearerKey) return resolveHosted(bearerKey);
+  const headerKey = req.get('X-API-Key');
+  if (headerKey?.startsWith('usr_')) return resolveHosted(headerKey);
+
+  if (headerKey || req.get('X-ZeroBounce-Api-Key')) return resolveSelfHosted(req);
+
+  const queryKey = req.query.api_key ?? req.query.apiKey;
+  if (typeof queryKey === 'string' && queryKey.trim()) {
+    if (!queryKey.startsWith('usr_')) {
+      // v1 accepted raw ZeroBounce keys in the URL; they end up in proxy logs, so v2 doesn't.
+      throw new HttpError(
+        400,
+        'raw_key_not_supported',
+        `Raw ZeroBounce API keys are no longer accepted in the URL. Create a personal usr_ key at ${KEY_PORTAL_URL} ` +
+          'and connect to /mcp/usr_..., or use the X-API-Key + X-ZeroBounce-Api-Key headers on a self-hosted server.',
+      );
+    }
+    return resolveHosted(queryKey);
+  }
+
+  throw new HttpError(
+    401,
+    'missing_auth',
+    `Authentication required. Connect to ${withPublicBasePath('/mcp/usr_...')} (or send "Authorization: Bearer usr_...") with your personal key from ${KEY_PORTAL_URL}, ` +
+      'or (self-hosted) send X-API-Key and X-ZeroBounce-Api-Key headers.',
+  );
+}
+
+// =============================================================================
+// Per-request MCP handling
+// =============================================================================
+
+function createDiagnosticsServer(): McpServer {
+  const server = new McpServer({ name: `${SERVER_NAME} (diagnostics)`, version: SERVER_VERSION });
+  server.registerTool(
+    'diagnostics_ping',
+    { title: 'Diagnostics ping', description: 'Returns "pong". Verifies transport and initialization only.', annotations: { readOnlyHint: true } },
+    async () => ({ content: [{ type: 'text', text: 'pong' }] }),
+  );
   return server;
 }
 
-// ============================================================================
-// Express App
-// ============================================================================
+async function serveMcp(req: Request, res: Response, credentials: Credentials | null): Promise<void> {
+  const server = credentials
+    ? createZeroBounceServer({
+        apiKey: credentials.apiKey,
+        region: credentials.region,
+        transport: 'http',
+        authMode: credentials.authMode,
+        maxResultBytes: MAX_RESULT_MB * 1024 * 1024,
+        onToolComplete: event => analytics.trackToolCall(event.tool, event.isError, event.durationMs),
+      })
+    : createDiagnosticsServer();
+
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined, // stateless
+    enableJsonResponse: true, // plain JSON responses: simpler for proxies and curl
+  });
+
+  // Idempotent cleanup once the response is done.
+  let cleanedUp = false;
+  const cleanup = () => {
+    if (cleanedUp) return;
+    cleanedUp = true;
+    void transport.close();
+    void server.close();
+  };
+  res.once('finish', cleanup);
+  res.once('close', cleanup);
+
+  try {
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (error) {
+    cleanup();
+    throw error;
+  }
+}
+
+/** Express handler factory for the MCP endpoints. */
+function mcpHandler(getCredentials: (req: Request) => Promise<Credentials | null>) {
+  return async (req: Request, res: Response) => {
+    // Stateless server: there is no session to stream (GET) or terminate (DELETE).
+    if (req.method !== 'POST') {
+      res.setHeader('Allow', 'POST, OPTIONS');
+      sendError(req, res, new HttpError(405, 'method_not_allowed', 'Method not allowed. Send MCP JSON-RPC requests with POST.'));
+      return;
+    }
+
+    try {
+      ensureAcceptHeader(req);
+      const credentials = await getCredentials(req);
+      await serveMcp(req, res, credentials);
+      traceHttp(req, res, { authMode: credentials?.authMode ?? 'diagnostics' });
+    } catch (error) {
+      if (error instanceof HttpError) {
+        if (error.status >= 500) console.error(`[mcp] ${error.code}: ${error.message} (${sanitizeUrlForLogs(req.originalUrl)})`);
+        traceHttp(req, res, { error: error.code });
+        sendError(req, res, error);
+        return;
+      }
+      console.error(`[mcp] Unhandled error for ${sanitizeUrlForLogs(req.originalUrl)}:`, error);
+      sendError(req, res, new HttpError(500, 'internal_error', 'Unexpected server error.'));
+    }
+  };
+}
+
+// =============================================================================
+// Express app
+// =============================================================================
 
 const app = express();
-app.use(express.json());
 
-// CORS configuration
-app.use(cors({
-  origin: '*',
-  methods: ['GET', 'POST', 'OPTIONS', 'PUT', 'DELETE'],
-  allowedHeaders: [
-    'Content-Type',
-    'Authorization',
-    'X-API-Key',
-    'Accept',
-    'Accept-Encoding',
-    'Cache-Control',
-    'Connection',
-    'User-Agent',
-    'X-Requested-With',
-  ],
-  exposedHeaders: ['Content-Type', 'Cache-Control'],
-  credentials: false,
-  maxAge: 86400,
-}));
+// Only trust X-Forwarded-For from local proxies (nginx on the host / Docker network).
+app.set('trust proxy', 'loopback, linklocal, uniquelocal');
+app.disable('x-powered-by');
 
-app.options('*', cors());
-
-// ============================================================================
-// Endpoints
-// ============================================================================
-
-// Root - server info
-app.get('/', (req: Request, res: Response) => {
-  trackRequest(req, '/');
-  res.json({
-    name: 'ZeroBounce MCP Server',
-    version: '1.0.0',
-    description: 'MCP server for ZeroBounce email validation API',
-    transport: 'streamable-http',
-    endpoints: {
-      mcp: '/mcp',
-      health: '/health',
-      analytics: '/analytics',
-      dashboard: '/analytics/dashboard',
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin || ALLOW_ALL_ORIGINS || ALLOWED_ORIGINS.includes(origin)) callback(null, true);
+      else callback(new Error('Not allowed by CORS'));
     },
+    methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+    allowedHeaders: [
+      'Content-Type',
+      'Accept',
+      'Authorization',
+      'Mcp-Session-Id',
+      'Mcp-Protocol-Version',
+      'Last-Event-ID',
+      'X-API-Key',
+      'X-ZeroBounce-Api-Key',
+      'X-ZeroBounce-Region',
+    ],
+    exposedHeaders: ['Mcp-Session-Id', 'Mcp-Protocol-Version'],
+    maxAge: 86400,
+  }),
+);
+
+app.use(express.json({ limit: BODY_LIMIT }));
+
+// Track every request except the analytics endpoints themselves.
+app.use((req: Request, _res: Response, next: NextFunction) => {
+  if (!req.path.startsWith('/analytics')) {
+    analytics.trackRequest({
+      method: req.method,
+      endpoint: normalizeRoute(req),
+      ip: req.ip || req.socket.remoteAddress || 'unknown',
+      userAgent: req.get('user-agent'),
+    });
+  }
+  next();
+});
+
+// ---- Info & health -----------------------------------------------------------
+
+app.get('/', (_req: Request, res: Response) => {
+  res.json({
+    name: SERVER_NAME,
+    version: SERVER_VERSION,
+    description: 'MCP server for the ZeroBounce email validation API',
+    transport: 'streamable-http',
+    protocolVersion: MCP_PROTOCOL_VERSION,
+    tools: ALL_TOOLS.length,
+    endpoints: {
+      mcp: withPublicBasePath('/mcp/{usr_key}'),
+      mcpSelfHosted: withPublicBasePath('/mcp'),
+      health: withPublicBasePath('/health'),
+      serverCard: withPublicBasePath('/.well-known/mcp/server-card.json'),
+      analytics: withPublicBasePath('/analytics'),
+      analyticsDashboard: withPublicBasePath('/analytics/dashboard'),
+      ...(ENABLE_MCP_DIAGNOSTICS ? { diagnostics: withPublicBasePath('/mcp-debug/open') } : {}),
+    },
+    getAKey: KEY_PORTAL_URL,
+    documentation: 'https://github.com/hithereiamaliff/mcp-zerobounce',
   });
 });
 
-// Health check
-app.get('/health', (req: Request, res: Response) => {
-  trackRequest(req, '/health');
+app.get('/health', (_req: Request, res: Response) => {
   res.json({
     status: 'healthy',
-    server: 'ZeroBounce MCP Server',
-    version: '1.0.0',
+    server: SERVER_NAME,
+    version: SERVER_VERSION,
     transport: 'streamable-http',
-    uptime: getUptime(),
+    protocolVersion: MCP_PROTOCOL_VERSION,
+    uptime: analytics.uptime(),
+    keyService: keyService.enabled ? 'configured' : 'not configured',
     timestamp: new Date().toISOString(),
   });
 });
 
-// Analytics JSON
-app.get('/analytics', (req: Request, res: Response) => {
-  trackRequest(req, '/analytics');
+// ---- Discovery ---------------------------------------------------------------
+
+app.get('/.well-known/mcp/server-card.json', (_req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'public, max-age=3600');
   res.json({
-    ...analytics,
-    uptime: getUptime(),
-    currentTime: new Date().toISOString(),
+    $schema: 'https://static.modelcontextprotocol.io/schemas/mcp-server-card/v1.json',
+    version: '1.0',
+    protocolVersion: MCP_PROTOCOL_VERSION,
+    serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
+    description: 'ZeroBounce email validation, AI scoring, email finder, allow/block filters, bulk files and list evaluation.',
+    transport: { type: 'streamable-http', endpoint: withPublicBasePath('/mcp') },
+    authentication: { required: true },
+    tools: ALL_TOOLS.map(tool => ({
+      name: tool.name,
+      title: tool.title,
+      description: describeTool(tool),
+      annotations: tool.annotations,
+    })),
   });
 });
 
-// Analytics - Tool usage stats
-app.get('/analytics/tools', (req: Request, res: Response) => {
-  trackRequest(req, '/analytics/tools');
-
-  const toolStats = Object.entries(analytics.toolCalls)
-    .map(([name, count]) => ({ name, count }))
-    .sort((a, b) => b.count - a.count);
-
-  res.json({
-    totalToolCalls: analytics.totalToolCalls,
-    tools: toolStats,
-    recentCalls: analytics.recentToolCalls.slice(0, 20),
-  });
+// This server doesn't implement OAuth; answer clearly so clients don't keep probing.
+app.all(['/.well-known/oauth-protected-resource', '/.well-known/oauth-protected-resource/{*path}'], (_req: Request, res: Response) => {
+  res.status(404).json({ error: 'oauth_metadata_not_supported' });
+});
+app.all(['/.well-known/oauth-authorization-server', '/.well-known/oauth-authorization-server/{*path}'], (_req: Request, res: Response) => {
+  res.status(404).json({ error: 'oauth_metadata_not_supported' });
 });
 
-// Analytics Dashboard (HTML)
-app.get('/analytics/dashboard', (req: Request, res: Response) => {
-  trackRequest(req, '/analytics/dashboard');
+// ---- Analytics (data requires MCP_API_KEY) --------------------------------------
 
-  const html = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>ZeroBounce MCP Analytics</title>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #e2e8f0; padding: 20px; }
-    .header { text-align: center; margin-bottom: 30px; }
-    .header h1 { font-size: 24px; color: #38bdf8; }
-    .header p { color: #94a3b8; font-size: 14px; margin-top: 5px; }
-    .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 30px; }
-    .stat-card { background: #1e293b; border-radius: 12px; padding: 20px; text-align: center; border: 1px solid #334155; }
-    .stat-card .value { font-size: 32px; font-weight: bold; color: #38bdf8; }
-    .stat-card .label { font-size: 12px; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px; margin-top: 5px; }
-    .charts-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 20px; margin-bottom: 30px; }
-    .chart-card { background: #1e293b; border-radius: 12px; padding: 20px; border: 1px solid #334155; }
-    .chart-card h3 { color: #38bdf8; margin-bottom: 15px; font-size: 16px; }
-    .recent-calls { background: #1e293b; border-radius: 12px; padding: 20px; border: 1px solid #334155; }
-    .recent-calls h3 { color: #38bdf8; margin-bottom: 15px; }
-    .call-item { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #334155; font-size: 13px; }
-    .call-item:last-child { border-bottom: none; }
-    .call-tool { color: #a78bfa; font-weight: 500; }
-    .call-time { color: #94a3b8; }
-    .refresh-note { text-align: center; color: #64748b; font-size: 12px; margin-top: 20px; }
-    canvas { max-height: 300px; }
-  </style>
-</head>
-<body>
-  <div class="header">
-    <h1>ZeroBounce MCP Server - Analytics Dashboard</h1>
-    <p>Real-time server metrics and usage statistics</p>
-  </div>
-
-  <div class="stats-grid">
-    <div class="stat-card"><div class="value" id="totalRequests">-</div><div class="label">Total Requests</div></div>
-    <div class="stat-card"><div class="value" id="totalToolCalls">-</div><div class="label">Tool Calls</div></div>
-    <div class="stat-card"><div class="value" id="uptime">-</div><div class="label">Uptime</div></div>
-    <div class="stat-card"><div class="value" id="uniqueClients">-</div><div class="label">Unique Clients</div></div>
-  </div>
-
-  <div class="charts-grid">
-    <div class="chart-card">
-      <h3>Tool Usage Distribution</h3>
-      <canvas id="toolChart"></canvas>
-    </div>
-    <div class="chart-card">
-      <h3>Hourly Requests (Last 24h)</h3>
-      <canvas id="hourlyChart"></canvas>
-    </div>
-    <div class="chart-card">
-      <h3>Requests by Endpoint</h3>
-      <canvas id="endpointChart"></canvas>
-    </div>
-    <div class="chart-card">
-      <h3>Top Clients by User Agent</h3>
-      <canvas id="clientChart"></canvas>
-    </div>
-  </div>
-
-  <div class="recent-calls">
-    <h3>Recent Tool Calls</h3>
-    <div id="recentCallsList"></div>
-  </div>
-
-  <p class="refresh-note">Auto-refreshes every 30 seconds</p>
-
-  <script>
-    let toolChart, hourlyChart, endpointChart, clientChart;
-
-    const chartColors = ['#38bdf8', '#a78bfa', '#34d399', '#fb923c', '#f87171', '#fbbf24', '#818cf8', '#2dd4bf', '#e879f9', '#f472b6'];
-
-    async function fetchAnalytics() {
-      const basePath = window.location.pathname.replace(/\\/analytics\\/dashboard\\/?$/, '');
-      const res = await fetch(basePath + '/analytics');
-      return res.json();
-    }
-
-    function updateStats(data) {
-      document.getElementById('totalRequests').textContent = data.totalRequests.toLocaleString();
-      document.getElementById('totalToolCalls').textContent = data.totalToolCalls.toLocaleString();
-      document.getElementById('uptime').textContent = data.uptime;
-      document.getElementById('uniqueClients').textContent = Object.keys(data.clientsByIp || {}).length;
-    }
-
-    function updateToolChart(data) {
-      const entries = Object.entries(data.toolCalls || {}).sort((a, b) => b[1] - a[1]);
-      const labels = entries.map(e => e[0]);
-      const values = entries.map(e => e[1]);
-
-      if (toolChart) toolChart.destroy();
-      toolChart = new Chart(document.getElementById('toolChart'), {
-        type: 'doughnut',
-        data: { labels, datasets: [{ data: values, backgroundColor: chartColors }] },
-        options: { responsive: true, plugins: { legend: { position: 'bottom', labels: { color: '#94a3b8', font: { size: 11 } } } } }
-      });
-    }
-
-    function updateHourlyChart(data) {
-      const now = new Date();
-      const hours = [];
-      for (let i = 23; i >= 0; i--) {
-        const d = new Date(now - i * 3600000);
-        hours.push(d.toISOString().substring(0, 13));
-      }
-      const labels = hours.map(h => h.substring(11) + ':00');
-      const values = hours.map(h => (data.hourlyRequests || {})[h] || 0);
-
-      if (hourlyChart) hourlyChart.destroy();
-      hourlyChart = new Chart(document.getElementById('hourlyChart'), {
-        type: 'line',
-        data: { labels, datasets: [{ label: 'Requests', data: values, borderColor: '#38bdf8', backgroundColor: 'rgba(56,189,248,0.1)', fill: true, tension: 0.4 }] },
-        options: { responsive: true, scales: { x: { ticks: { color: '#64748b' }, grid: { color: '#1e293b' } }, y: { beginAtZero: true, ticks: { color: '#64748b' }, grid: { color: '#1e293b' } } }, plugins: { legend: { display: false } } }
-      });
-    }
-
-    function updateEndpointChart(data) {
-      const entries = Object.entries(data.requestsByEndpoint || {}).sort((a, b) => b[1] - a[1]).slice(0, 10);
-      const labels = entries.map(e => e[0]);
-      const values = entries.map(e => e[1]);
-
-      if (endpointChart) endpointChart.destroy();
-      endpointChart = new Chart(document.getElementById('endpointChart'), {
-        type: 'bar',
-        data: { labels, datasets: [{ label: 'Requests', data: values, backgroundColor: '#a78bfa' }] },
-        options: { responsive: true, indexAxis: 'y', scales: { x: { ticks: { color: '#64748b' }, grid: { color: '#1e293b' } }, y: { ticks: { color: '#94a3b8' }, grid: { display: false } } }, plugins: { legend: { display: false } } }
-      });
-    }
-
-    function updateClientChart(data) {
-      const entries = Object.entries(data.clientsByUserAgent || {}).sort((a, b) => b[1] - a[1]).slice(0, 8);
-      const labels = entries.map(e => e[0]);
-      const values = entries.map(e => e[1]);
-
-      if (clientChart) clientChart.destroy();
-      clientChart = new Chart(document.getElementById('clientChart'), {
-        type: 'bar',
-        data: { labels, datasets: [{ label: 'Requests', data: values, backgroundColor: '#34d399' }] },
-        options: { responsive: true, indexAxis: 'y', scales: { x: { ticks: { color: '#64748b' }, grid: { color: '#1e293b' } }, y: { ticks: { color: '#94a3b8', font: { size: 10 } }, grid: { display: false } } }, plugins: { legend: { display: false } } }
-      });
-    }
-
-    function updateRecentCalls(data) {
-      const list = document.getElementById('recentCallsList');
-      const calls = (data.recentToolCalls || []).slice(0, 15);
-      if (calls.length === 0) {
-        list.innerHTML = '<p style="color:#64748b;text-align:center">No tool calls yet</p>';
-        return;
-      }
-      list.innerHTML = calls.map(c => {
-        const time = new Date(c.timestamp).toLocaleString();
-        return '<div class="call-item"><span class="call-tool">' + c.tool + '</span><span class="call-time">' + time + '</span></div>';
-      }).join('');
-    }
-
-    async function refresh() {
-      try {
-        const data = await fetchAnalytics();
-        updateStats(data);
-        updateToolChart(data);
-        updateHourlyChart(data);
-        updateEndpointChart(data);
-        updateClientChart(data);
-        updateRecentCalls(data);
-      } catch (e) {
-        console.error('Failed to fetch analytics:', e);
-      }
-    }
-
-    refresh();
-    setInterval(refresh, 30000);
-  </script>
-</body>
-</html>`;
-
-  res.type('html').send(html);
-});
-
-// Analytics import endpoint
-app.post('/analytics/import', (req: Request, res: Response) => {
-  trackRequest(req, '/analytics/import');
-  const importKey = process.env.ANALYTICS_IMPORT_KEY;
-  if (!importKey) {
-    res.status(403).json({ error: 'Import endpoint is disabled' });
-    return;
+function requireApiKey(req: Request, res: Response): boolean {
+  if (!MCP_API_KEY) {
+    res.status(503).json({ error: 'server_misconfigured', message: 'Set MCP_API_KEY to enable analytics.' });
+    return false;
   }
-  const providedKey = req.headers['x-import-key'] as string || req.query.key as string;
-  if (providedKey !== importKey) {
-    res.status(403).json({ error: 'Invalid import key' });
-    return;
-  }
-  try {
-    const importData = req.body;
-    if (importData.totalRequests) analytics.totalRequests += importData.totalRequests;
-    if (importData.totalToolCalls) analytics.totalToolCalls += importData.totalToolCalls;
-    saveAnalytics();
-    res.json({
-      message: 'Analytics imported successfully',
-      currentStats: {
-        totalRequests: analytics.totalRequests,
-        totalToolCalls: analytics.totalToolCalls,
-      },
-    });
-  } catch (error) {
-    res.status(400).json({ error: 'Failed to import analytics', details: String(error) });
-  }
-});
-
-// ============================================================================
-// MCP Endpoint
-// ============================================================================
-
-app.all('/mcp', async (req: Request, res: Response) => {
-  // Fix Accept header for MCP SDK compatibility
-  const acceptHeader = req.headers['accept'] || '';
-  if (!acceptHeader.includes('text/event-stream')) {
-    req.headers['accept'] = acceptHeader ? `${acceptHeader}, text/event-stream` : 'text/event-stream';
-  }
-
-  trackRequest(req, '/mcp');
-
-  // Track tool calls
-  if (req.body && req.body.method === 'tools/call' && req.body.params?.name) {
-    trackToolCall(req.body.params.name, req);
-  }
-
-  try {
-    // Resolve API key from query param, header, or environment
-    const apiKey = req.query.apiKey as string
-      || req.headers['x-api-key'] as string
-      || process.env.ZEROBOUNCE_API_KEY
-      || '';
-
-    // Create MCP server with resolved API key
-    const mcpServer = createMcpServer(apiKey);
-
-    // Create a NEW transport for EACH request (stateless mode)
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined,
-    });
-
-    // Clean up transport after response is sent
-    res.on('close', () => {
-      transport.close();
-    });
-
-    await mcpServer.connect(transport);
-    await transport.handleRequest(req, res, req.body);
-  } catch (error) {
-    console.error('MCP request error:', error);
-    if (!res.headersSent) {
-      res.status(500).json({ error: 'Internal server error', details: String(error) });
-    }
-  }
-});
-
-// ============================================================================
-// Graceful Shutdown
-// ============================================================================
-
-async function gracefulShutdown(signal: string) {
-  console.log(`\nReceived ${signal}, shutting down gracefully...`);
-  clearInterval(saveInterval);
-  saveAnalytics();
-  console.log('Analytics saved. Goodbye!');
-  process.exit(0);
+  if (safeEqual(req.get('X-API-Key'), MCP_API_KEY)) return true;
+  res.status(401).json({ error: 'unauthorized', message: 'Valid X-API-Key header required.' });
+  return false;
 }
 
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-
-// ============================================================================
-// Start Server
-// ============================================================================
-
-app.listen(PORT, HOST, () => {
-  console.log(`\n🚀 ZeroBounce MCP Server (HTTP) running on http://${HOST}:${PORT}`);
-  console.log(`   Health:    http://${HOST}:${PORT}/health`);
-  console.log(`   MCP:       http://${HOST}:${PORT}/mcp`);
-  console.log(`   Analytics: http://${HOST}:${PORT}/analytics`);
-  console.log(`   Dashboard: http://${HOST}:${PORT}/analytics/dashboard`);
-  console.log(`\n📊 Analytics saved to: ${ANALYTICS_FILE}`);
+app.get('/analytics', (req: Request, res: Response) => {
+  if (!requireApiKey(req, res)) return;
+  res.json(analytics.summary(SERVER_NAME));
 });
+
+app.get('/analytics/tools', (req: Request, res: Response) => {
+  if (!requireApiKey(req, res)) return;
+  res.json(analytics.toolStats());
+});
+
+app.get('/analytics/dashboard', (_req: Request, res: Response) => {
+  res.type('html').send(dashboardHtml(SERVER_NAME));
+});
+
+// ---- MCP endpoints -------------------------------------------------------------
+
+if (ENABLE_MCP_DIAGNOSTICS) {
+  app.all('/mcp-debug/open', mcpHandler(async () => null));
+}
+
+// Hosted (recommended): https://mcp.techmavie.digital/zerobounce/mcp/usr_xxx
+app.all('/mcp/:userKey', mcpHandler(async req => resolveHosted(String(req.params.userKey))));
+
+// Hosted via ?api_key=usr_xxx, or self-hosted via headers.
+app.all('/mcp', mcpHandler(resolveFromRequest));
+
+// ---- Fallbacks -------------------------------------------------------------------
+
+app.use((_req: Request, res: Response) => {
+  res.status(404).json({ error: 'not_found', message: 'Unknown endpoint. See / for available endpoints.' });
+});
+
+// Body-parser and CORS errors → JSON instead of an HTML stack trace.
+app.use((error: Error & { status?: number; type?: string }, req: Request, res: Response, _next: NextFunction) => {
+  if (error.type === 'entity.too.large') {
+    sendError(req, res, new HttpError(413, 'payload_too_large', `Request body is larger than ${BODY_LIMIT}.`));
+  } else if (error.type === 'entity.parse.failed') {
+    if (!res.headersSent) res.status(400).json({ jsonrpc: '2.0', error: { code: -32700, message: 'Parse error: invalid JSON' }, id: null });
+  } else if (error.message === 'Not allowed by CORS') {
+    if (!res.headersSent) res.status(403).json({ error: 'cors_rejected', message: 'Origin not allowed.' });
+  } else {
+    console.error('Unhandled HTTP error:', error);
+    if (!res.headersSent) res.status(500).json({ error: 'internal_error', message: 'Unexpected server error.' });
+  }
+});
+
+// =============================================================================
+// Start & graceful shutdown
+// =============================================================================
+
+const httpServer: Server = app.listen(PORT, HOST, (error?: Error) => {
+  // Express 5 passes startup errors (e.g. port already in use) to this callback.
+  if (error) {
+    console.error(`Failed to start on ${HOST}:${PORT}: ${error.message}`);
+    process.exit(1);
+  }
+  const line = '='.repeat(64);
+  console.log(line);
+  console.log(`${SERVER_NAME} (Streamable HTTP) v${SERVER_VERSION}`);
+  console.log(line);
+  console.log(`Listening:        http://${HOST}:${PORT}`);
+  console.log(`MCP (hosted):     ${withPublicBasePath('/mcp/usr_...')}  or  ${withPublicBasePath('/mcp?api_key=usr_...')}`);
+  console.log(`MCP (self-host):  ${withPublicBasePath('/mcp')} with X-API-Key + X-ZeroBounce-Api-Key`);
+  console.log(`Health:           ${withPublicBasePath('/health')}`);
+  console.log(`Server card:      ${withPublicBasePath('/.well-known/mcp/server-card.json')}`);
+  console.log(`Analytics:        ${withPublicBasePath('/analytics/dashboard')}`);
+  console.log(`Tools:            ${ALL_TOOLS.length}`);
+  console.log(`Key service:      ${keyService.enabled ? `configured (${KEY_SERVICE_URL})` : 'not configured'}`);
+  console.log(`Self-hosted auth: ${MCP_API_KEY ? 'enabled' : 'disabled (set MCP_API_KEY)'}`);
+  console.log(`Server ZB key:    ${SERVER_ZEROBOUNCE_API_KEY ? 'set (self-hosted fallback)' : 'not set'}`);
+  console.log(`Default region:   ${DEFAULT_REGION}`);
+  console.log(`Diagnostics:      ${ENABLE_MCP_DIAGNOSTICS ? 'enabled' : 'disabled'} | HTTP tracing: ${MCP_TRACE_HTTP ? 'on' : 'off'}`);
+  console.log(`CORS origins:     ${ALLOW_ALL_ORIGINS ? '*' : ALLOWED_ORIGINS.join(', ')}`);
+  console.log(line);
+});
+
+function shutdown(signal: string): void {
+  console.log(`Received ${signal}, saving analytics and shutting down...`);
+  analytics.save();
+  keyService.dispose();
+  httpServer.close(() => process.exit(0));
+  // Don't hang forever on open connections.
+  setTimeout(() => process.exit(0), 5000).unref();
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
