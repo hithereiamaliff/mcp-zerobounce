@@ -1,50 +1,42 @@
 # ZeroBounce MCP Server - Streamable HTTP
-# For self-hosting on VPS with nginx reverse proxy
+# Multi-stage build: compile TypeScript in a builder image, ship only runtime files.
 
-FROM node:20-alpine
+# ---- Build stage ---------------------------------------------------------------
+FROM node:24-alpine AS builder
 
 WORKDIR /app
 
-# Copy package files
-COPY package*.json ./
-COPY tsconfig.json ./
-
-# Install ALL dependencies (including devDependencies for build)
-# Skip prepare script since source files aren't copied yet
+COPY package*.json tsconfig.json ./
+# --ignore-scripts: skip the "prepare" build until the sources are copied
 RUN npm ci --ignore-scripts
 
-# Copy source code
 COPY src/ ./src/
+RUN npm run build:tsc && npm prune --omit=dev
 
-# Build TypeScript
-RUN npm run build:tsc
+# ---- Runtime stage -------------------------------------------------------------
+FROM node:24-alpine
 
-# Remove devDependencies after build
-RUN npm prune --production
+WORKDIR /app
 
-# Create non-root user for security
-RUN addgroup -g 1001 -S nodejs && \
-    adduser -S mcp -u 1001
+ENV NODE_ENV=production \
+    PORT=8080 \
+    HOST=0.0.0.0 \
+    ANALYTICS_DIR=/app/data
 
-# Create data directory for analytics
-RUN mkdir -p /app/data
+# Non-root user
+RUN addgroup -g 1001 -S nodejs && adduser -S mcp -u 1001 -G nodejs
 
-# Set ownership
-RUN chown -R mcp:nodejs /app
+COPY --from=builder --chown=mcp:nodejs /app/package.json ./
+COPY --from=builder --chown=mcp:nodejs /app/node_modules ./node_modules
+COPY --from=builder --chown=mcp:nodejs /app/dist ./dist
+
+RUN mkdir -p /app/data && chown -R mcp:nodejs /app/data
 
 USER mcp
 
-# Expose port for HTTP server
 EXPOSE 8080
 
-# Environment variables (can be overridden at runtime)
-ENV PORT=8080
-ENV HOST=0.0.0.0
-ENV ANALYTICS_DIR=/app/data
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+  CMD wget --no-verbose --tries=1 --spider http://127.0.0.1:8080/health || exit 1
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-  CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
-
-# Start the HTTP server
-CMD ["node", "build/http-server.js"]
+CMD ["node", "dist/http-server.js"]

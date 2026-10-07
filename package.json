@@ -1,50 +1,66 @@
 {
   "name": "mcp-zerobounce",
-  "version": "1.0.0",
-  "description": "A Model Context Protocol (MCP) server for accessing ZeroBounce API endpoints.",
-  "main": "build/index.js",
+  "version": "2.0.0",
+  "description": "MCP server for the ZeroBounce email validation API: validation, AI scoring, email finder, allow/block filters, bulk files and list evaluation. Hosted via mcp-key-service or run locally over stdio.",
   "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "bin": {
-    "mcp-zerobounce": "build/index.js"
+    "mcp-zerobounce": "dist/cli.js"
   },
   "files": [
-    "build/"
+    "dist"
   ],
-  "scripts": {
-    "build": "tsc",
-    "build:tsc": "tsc",
-    "dev": "npx @smithery/cli dev",
-    "dev:http": "npx tsx src/http-server.ts",
-    "start": "node build/index.js",
-    "start:http": "node build/http-server.js",
-    "prepare": "npm run build"
+  "engines": {
+    "node": ">=20"
   },
-  "publishConfig": {
-    "access": "public"
+  "scripts": {
+    "build": "npm run build:tsc",
+    "build:tsc": "tsc",
+    "dev": "npm run dev:http",
+    "dev:http": "tsx src/http-server.ts",
+    "start": "node dist/http-server.js",
+    "start:http": "node dist/http-server.js",
+    "cli": "node dist/cli.js",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "smoke": "node scripts/smoke-test.mjs",
+    "prepare": "npm run build",
+    "docs:tools": "tsx scripts/generate-tools-md.ts"
   },
   "keywords": [
     "mcp",
+    "model-context-protocol",
     "zerobounce",
     "email",
-    "validation",
     "email-validation",
-    "model-context-protocol"
+    "email-verification",
+    "email-finder"
   ],
   "author": "hithereiamaliff",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hithereiamaliff/mcp-zerobounce.git"
+  },
+  "bugs": {
+    "url": "https://github.com/hithereiamaliff/mcp-zerobounce/issues"
+  },
+  "homepage": "https://github.com/hithereiamaliff/mcp-zerobounce#readme",
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.17.4",
-    "axios": "^1.7.2",
-    "cors": "^2.8.5",
-    "express": "^4.21.0",
-    "form-data": "^4.0.0",
-    "zod": "^3.23.8"
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
-    "@types/cors": "^2.8.17",
-    "@types/express": "^4.17.21",
-    "@types/node": "^20.12.12",
-    "tsx": "^4.20.5",
-    "typescript": "^5.4.5"
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.20.5",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
   }
 }
