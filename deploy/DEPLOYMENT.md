@@ -10,7 +10,7 @@ https://mcp.techmavie.digital/zerobounce
 |---|---|
 | Directory on VPS | `/opt/mcp-servers/zerobounce` |
 | Container | `mcp-zerobounce` |
-| Host port | `127.0.0.1:8095` (8087 is used by the Task List MCP) |
+| Host port | `127.0.0.1:8097` (8083-8096 are taken by other MCPs, e.g. 8087 Exa, 8095 YouTube, 8096 Google Workspace) |
 | Docker network | `mcp-network` (external, shared with `mcp-key-service`) |
 | Key-service server ID | `zerobounce` |
 
@@ -68,7 +68,7 @@ Leave `ZEROBOUNCE_API_KEY` empty on the hosted server. Every user brings their o
 ### 4. Check the port is free and start the container
 
 ```bash
-ss -tlnp | grep ':8095' || echo "8095 is free"
+ss -tlnp | grep ':8097' || echo "8097 is free"
 docker network inspect mcp-network >/dev/null 2>&1 || docker network create mcp-network
 docker compose up -d --build
 docker compose logs -f
