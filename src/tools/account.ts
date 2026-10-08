@@ -6,10 +6,13 @@ import { z } from 'zod';
 import { formatNumber, isoDate, table } from '../utils/format.js';
 import { READ_ONLY, defineTool, jsonResult, responseFormatSchema, textResult, ToolInputError } from './shared.js';
 
-const dateSchema = z
-  .string()
-  .regex(/^\d{4}-\d{2}-\d{2}$/, 'Use the format YYYY-MM-DD')
-  .describe('Date in YYYY-MM-DD format');
+// A factory, not a shared instance: reusing one zod object for two fields makes the
+// JSON Schema contain a "$ref", which some strict MCP clients reject.
+const dateSchema = () =>
+  z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/, 'Use the format YYYY-MM-DD')
+    .describe('Date in YYYY-MM-DD format');
 
 export const getCredits = defineTool({
   name: 'zerobounce_get_credits',
@@ -35,8 +38,8 @@ export const getApiUsage = defineTool({
     'Get API usage for a date range: total validations plus a breakdown by status (valid, invalid, catch-all...) and sub-status. Defaults to the last 30 days.',
   cost: 'Free',
   inputSchema: {
-    start_date: dateSchema.optional().describe('Start date (YYYY-MM-DD). Defaults to 30 days before end_date.'),
-    end_date: dateSchema.optional().describe("End date (YYYY-MM-DD). Defaults to today's date (UTC)."),
+    start_date: dateSchema().optional().describe('Start date (YYYY-MM-DD). Defaults to 30 days before end_date.'),
+    end_date: dateSchema().optional().describe("End date (YYYY-MM-DD). Defaults to today's date (UTC)."),
     response_format: responseFormatSchema,
   },
   annotations: READ_ONLY,
