@@ -72,7 +72,7 @@ export const evaluateList = defineTool({
     emails: z.array(emailSchema).min(MIN_EMAILS).max(100_000).optional().describe(`Email addresses to evaluate (at least ${MIN_EMAILS})`),
     csv_content: z.string().min(1).max(5_000_000).optional().describe('Raw CSV text (alternative to emails)'),
     email_address_column: z.number().int().min(1).max(500).optional().describe('1-based column number of the email address in csv_content (default 1)'),
-    has_header_row: z.boolean().optional().describe('Whether csv_content / the file starts with a header row (default true; it is removed before upload)'),
+    has_header_row: z.boolean().optional().describe('Whether csv_content / the file starts with a header row (default true)'),
   },
   localInputSchema: {
     file_path: z.string().min(1).optional().describe('Path to a local CSV or TXT file to evaluate'),
@@ -86,10 +86,15 @@ export const evaluateList = defineTool({
       );
     }
 
+    // ZeroBounce's List Evaluator always treats the first row as a header (it has no
+    // has_header_row option; confirmed against the live API). So the upload must always
+    // start with a header row, or the first address is silently dropped.
+    let header: string[];
     let rows: string[][];
     let column = 1;
     let fileName = `mcp-list-evaluation-${Date.now()}.csv`;
     if (args.emails) {
+      header = ['email'];
       rows = args.emails.map(e => [e]);
     } else {
       let content = args.csv_content as string;
@@ -98,12 +103,18 @@ export const evaluateList = defineTool({
         content = file.content;
         fileName = file.fileName;
       }
-      rows = parseCsv(content);
-      // The List Evaluator has no has_header_row option, so strip the header ourselves.
-      if (args.has_header_row ?? true) rows = rows.slice(1);
+      const all = parseCsv(content);
       column = args.email_address_column ?? 1;
-      const widest = rows.reduce((max, r) => Math.max(max, r.length), 0);
+      const widest = all.reduce((max, r) => Math.max(max, r.length), 0);
       if (column > widest) throw new ToolInputError(`email_address_column is ${column}, but the CSV only has ${widest} column(s).`);
+      if (args.has_header_row ?? true) {
+        header = all[0] ?? [];
+        rows = all.slice(1);
+      } else {
+        // No header in the caller's data: add a generic one so no address is lost.
+        header = Array.from({ length: widest }, (_, i) => (i + 1 === column ? 'email' : `column_${i + 1}`));
+        rows = all;
+      }
     }
 
     // Check the minimum locally: ZeroBounce counts rejected requests towards a temporary block.
@@ -111,7 +122,7 @@ export const evaluateList = defineTool({
       throw new ToolInputError(`The List Evaluator needs at least ${MIN_EMAILS} email addresses (got ${rows.length}).`);
     }
 
-    const result = await ctx.getClient().evaluateList(toCsv(rows), fileName, column);
+    const result = await ctx.getClient().evaluateList(toCsv([header, ...rows]), fileName, column);
     return textResult(
       `Submitted ${formatNumber(rows.length)} addresses for evaluation.\n\n` + formatEvaluation(result, String(result.file_id ?? '')),
     );

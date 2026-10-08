@@ -336,7 +336,26 @@ test('bulk_status explains what to do next', async () => {
   await close();
 });
 
-test('evaluate_list checks the 100-address minimum locally and strips headers', async () => {
+test('evaluate_list always uploads a header row (ZeroBounce skips the first row)', async () => {
+  const f = fakeFetch(() => json({ file_id: 'le-2', status: 'processing', progress: 0 }, 201));
+  const { call, close } = await connect({ fetchImpl: f.fetch });
+  const emails = Array.from({ length: 100 }, (_, i) => `u${i}@x.com`);
+
+  // emails[] → header "email" is added, all 100 addresses follow.
+  await call('zerobounce_evaluate_list', { emails });
+  const fromList = await (f.requests[0].multipart!.get('file') as File).text();
+  assert.ok(fromList.startsWith('email\r\nu0@x.com\r\n'), fromList.slice(0, 40));
+  assert.equal(fromList.trim().split('\r\n').length, 101);
+
+  // CSV without a header → a generic header is added, the email column is named "email".
+  await call('zerobounce_evaluate_list', { csv_content: emails.map(e => `Name,${e}`).join('\n'), has_header_row: false, email_address_column: 2 });
+  const noHeader = await (f.requests[1].multipart!.get('file') as File).text();
+  assert.ok(noHeader.startsWith('column_1,email\r\nName,u0@x.com\r\n'), noHeader.slice(0, 40));
+  assert.equal(f.requests[1].multipart!.get('email_address_column'), '2');
+  await close();
+});
+
+test('evaluate_list checks the 100-address minimum locally and keeps the caller header', async () => {
   const f = fakeFetch(() => json({ file_id: 'le-1', status: 'processing', progress: 0 }, 201));
   const { call, close } = await connect({ fetchImpl: f.fetch });
 
@@ -349,7 +368,7 @@ test('evaluate_list checks the 100-address minimum locally and strips headers', 
   const ok = await call('zerobounce_evaluate_list', { csv_content: csv });
   assert.equal(ok.isError, false, ok.text);
   const uploaded = await (f.requests[0].multipart!.get('file') as File).text();
-  assert.ok(uploaded.startsWith('u0@x.com'), 'header row should be removed');
+  assert.ok(uploaded.startsWith('email\r\nu0@x.com'), 'the caller header row should be kept as the first row');
   assert.match(ok.text, /le-1/);
   await close();
 });
