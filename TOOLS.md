@@ -374,7 +374,7 @@ Get a free estimate of how risky an email list is (percentage invalid, catch-all
 | `emails` | string[] | No | Email addresses to evaluate (at least 100) |
 | `csv_content` | string | No | Raw CSV text (alternative to emails) |
 | `email_address_column` | integer | No | 1-based column number of the email address in csv_content (default 1) |
-| `has_header_row` | boolean | No | Whether csv_content / the file starts with a header row (default true; it is removed before upload) |
+| `has_header_row` | boolean | No | Whether csv_content / the file starts with a header row (default true) |
 | `file_path` | string | No | Path to a local CSV or TXT file to evaluate. **(local CLI only)** |
 
 ### `zerobounce_evaluate_list_status`
