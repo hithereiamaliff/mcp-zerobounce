@@ -37,6 +37,16 @@ test('tools that spend credits are never marked read-only', () => {
   assert.deepEqual(destructive, ['zerobounce_bulk_delete', 'zerobounce_delete_filter']);
 });
 
+test('tool input schemas contain no $ref (strict clients reject them)', async () => {
+  for (const allowLocalFiles of [false, true]) {
+    const conn = await connect({ allowLocalFiles, transport: allowLocalFiles ? 'stdio' : 'http' });
+    for (const tool of (await conn.client.listTools()).tools) {
+      assert.ok(!JSON.stringify(tool.inputSchema).includes('"$ref"'), `${tool.name} schema contains $ref`);
+    }
+    await conn.close();
+  }
+});
+
 test('local file parameters are only exposed in CLI mode', async () => {
   const http = await connect({ allowLocalFiles: false });
   const cli = await connect({ allowLocalFiles: true, transport: 'stdio' });
