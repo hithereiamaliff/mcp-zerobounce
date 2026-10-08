@@ -121,6 +121,39 @@ test('validate_email formats a verdict with explanations', async () => {
   await close();
 });
 
+test('validate_email hides "unchecked" domain-info placeholders', async () => {
+  const f = fakeFetch(() =>
+    json({
+      address: 'aliff@techmavie.digital',
+      status: 'valid',
+      sub_status: '',
+      domain: 'techmavie.digital',
+      domain_website_exists: 'unchecked',
+      domain_registrant_company_name: 'unchecked',
+      active_in_days: null,
+      active_first_seen: null,
+    }),
+  );
+  const { call, close } = await connect({ fetchImpl: f.fetch });
+  const result = await call('zerobounce_validate_email', { email: 'aliff@techmavie.digital', domain_info: true, activity_data: true });
+  assert.match(result.text, /Website exists:\*\* not checked by ZeroBounce/);
+  assert.doesNotMatch(result.text, /registrant/i);
+  assert.match(result.text, /Activity:\*\* no activity data/);
+  await close();
+});
+
+test('score_email explains what a score of 0 means, and only for 0', async () => {
+  const f = fakeFetch(() => json({ email: 'a@x.com', score: 0 }), () => json({ email: 'b@x.com', score: '7' }));
+  const { call, close } = await connect({ fetchImpl: f.fetch });
+  const zero = await call('zerobounce_score_email', { email: 'a@x.com' });
+  assert.match(zero.text, /AI score 0\/10/);
+  assert.match(zero.text, /doesn't mean the address is invalid/);
+  const seven = await call('zerobounce_score_email', { email: 'b@x.com' });
+  assert.match(seven.text, /AI score 7\/10/);
+  assert.doesNotMatch(seven.text, /doesn't mean/);
+  await close();
+});
+
 test('validate_batch removes duplicates before spending credits', async () => {
   const f = fakeFetch(() =>
     json({
@@ -279,6 +312,16 @@ test('scoring results show an average and distribution', async () => {
   const result = await call('zerobounce_bulk_results', { service: 'scoring', file_id: 's-1' });
   assert.match(result.text, /Average score:\*\* 8\.0 \/ 10/);
   assert.match(result.text, /\| 10 \| 2 \| 66\.7% \|/);
+  assert.doesNotMatch(result.text, /score 0/, 'no zero-score note without zero scores');
+  await close();
+});
+
+test('scoring results add ZeroBounce guidance when some addresses score 0', async () => {
+  clearResultCache();
+  const f = fakeFetch(() => text('email,ZeroBounceQualityScore\r\na@x.com,0\r\nb@x.com,9', 200, 'application/octet-stream'));
+  const { call, close } = await connect({ fetchImpl: f.fetch });
+  const result = await call('zerobounce_bulk_results', { service: 'scoring', file_id: 's-0' });
+  assert.match(result.text, /recommends not mailing addresses that score 0/);
   await close();
 });
 
