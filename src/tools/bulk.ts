@@ -624,6 +624,9 @@ export function summariseResults(service: FileService, data: { headers: string[]
         '',
         table(['Score', 'Count', 'Share'], byScore.map(([s, c]) => [s, formatNumber(c), pct(c, total)])),
       );
+      if (scores.some(s => s === 0)) {
+        sections.push('', 'ZeroBounce recommends not mailing addresses that score 0 (very low predicted engagement, not necessarily invalid).');
+      }
     }
   } else {
     const confidenceCol = findColumn(headers, [/confidence/i]);

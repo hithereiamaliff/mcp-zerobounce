@@ -7,10 +7,13 @@ export function isTrue(value: unknown): boolean {
   return value === true || (typeof value === 'string' && value.toLowerCase() === 'true');
 }
 
-/** True for values worth showing (skips null, undefined, empty strings and "unknown"). */
+/** Placeholder strings ZeroBounce uses instead of null. */
+const PLACEHOLDERS = new Set(['', 'unknown', 'unchecked', 'n/a', 'null']);
+
+/** True for values worth showing (skips null, undefined, empty strings and placeholders like "unknown"/"unchecked"). */
 export function hasValue(value: unknown): boolean {
   if (value === null || value === undefined) return false;
-  if (typeof value === 'string') return value.trim() !== '' && value.toLowerCase() !== 'unknown';
+  if (typeof value === 'string') return !PLACEHOLDERS.has(value.trim().toLowerCase());
   return true;
 }
 

@@ -41,7 +41,8 @@ export function formatValidation(result: ValidateResult): string {
   let website: string | undefined;
   if ('domain_website_exists' in result) {
     const exists = result.domain_website_exists;
-    website = exists === 'unchecked' ? 'not checked' : isTrue(exists) ? 'yes' : 'no';
+    // ZeroBounce returns "unchecked" when it didn't run the domain check for this request.
+    website = exists === 'unchecked' || exists === null ? 'not checked by ZeroBounce' : isTrue(exists) ? 'yes' : 'no';
     if (hasValue(result.domain_registrant_company_name)) website += `; registrant: ${result.domain_registrant_company_name}`;
   }
 
@@ -190,6 +191,22 @@ export const getActivityData = defineTool({
   },
 });
 
+/**
+ * ZeroBounce's own guidance on what a score of 0 means, so it isn't misread as "invalid".
+ * Source: https://www.zerobounce.net/docs/ai-email-scoring
+ */
+export const ZERO_SCORE_NOTE =
+  "A score of 0 doesn't mean the address is invalid: ZeroBounce's AI predicts very low engagement " +
+  '(for example inactive, disabled or trap-like addresses, or ones it has little data on), and ZeroBounce ' +
+  'recommends not mailing 0-scored addresses. Use zerobounce_validate_email to check deliverability.';
+
+/** Markdown for one AI score. Exported for tests. */
+export function formatScore(email: string, score: number | string): string {
+  const value = Number(score);
+  const line = `**${email}:** AI score ${score}/10 (0 = lowest, 10 = highest likelihood of engagement).`;
+  return value === 0 ? `${line}\n\n${ZERO_SCORE_NOTE}` : line;
+}
+
 export const scoreEmail = defineTool({
   name: 'zerobounce_score_email',
   title: 'AI-score an email address',
@@ -205,7 +222,7 @@ export const scoreEmail = defineTool({
   async handler({ email, response_format }, ctx) {
     const result = await ctx.getClient().scoreEmail(email);
     if (response_format === 'json') return jsonResult(result);
-    return textResult(`**${result.email ?? email}:** AI score ${result.score}/10 (0 = lowest quality, 10 = highest).`);
+    return textResult(formatScore(String(result.email ?? email), result.score));
   },
 });
 
